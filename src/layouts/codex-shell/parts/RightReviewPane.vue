@@ -6,6 +6,7 @@ import { useMcpStore } from "@/features/mcp/store/mcp.store"
 import { useProjectStore } from "@/features/projects/store/project.store"
 import { useThreadStore } from "@/features/threads/store/thread.store"
 import { useWorkspaceStore } from "@/features/workspace/store/workspace.store"
+import { toRelativeProjectPath } from "@/shared/utils/project-path"
 
 defineEmits<{ (event: "close"): void }>()
 
@@ -15,6 +16,7 @@ const projectStore = useProjectStore()
 const threadStore = useThreadStore()
 const workspaceStore = useWorkspaceStore()
 const demoMode = ref(false)
+const selectedDiffFile = ref<string>("")
 
 function getProjectDisplayName(projectPath?: string | null): string {
   if (!projectPath) return "未打开项目"
@@ -28,18 +30,55 @@ const activeTask = computed(() =>
   activeThreadId.value ? agentTaskStore.getLatestTaskByThread(activeThreadId.value) : null,
 )
 const projectName = computed(() => projectStore.currentProjectName || getProjectDisplayName(projectStore.currentProjectPath))
-const activeFile = computed(() => workspaceStore.activeTab?.filePath || "未选择")
+const projectPath = computed(() => projectStore.currentProjectPath)
+const activeFile = computed(() => toRelativeProjectPath(projectStore.currentProjectPath, workspaceStore.activeTab?.filePath))
 const openTabs = computed(() => workspaceStore.tabs?.length || 0)
+const openTabNames = computed(() => workspaceStore.tabs?.map((tab) => toRelativeProjectPath(projectStore.currentProjectPath, tab.filePath)) || [])
 const changedFiles = computed(() => activeTask.value?.changedFiles || [])
 const diffStats = computed(() => {
   if (demoMode.value) return { added: 0, removed: 0, files: 0 }
   const diff = activeTask.value?.diff
   return diff ? { added: diff.added, removed: diff.removed, files: diff.files } : null
 })
-const diffPreviewLines = computed(() => activeTask.value?.diff?.hunks?.[0]?.lines.slice(0, 10) || [])
+const diffHunks = computed(() => activeTask.value?.diff?.hunks || [])
+const selectedHunk = computed(() => {
+  if (!selectedDiffFile.value) return diffHunks.value[0] || null
+  return diffHunks.value.find((h) => h.filePath === selectedDiffFile.value) || null
+})
+const diffPreviewLines = computed(() => {
+  const hunk = selectedHunk.value
+  if (!hunk) return []
+  return hunk.lines.slice(0, 20)
+})
 const patchStatus = computed(() => activeTask.value?.patchStatus || "none")
+const patchStatusLabel = computed(() => {
+  const map: Record<string, string> = {
+    none: "无补丁",
+    proposed: "已提案",
+    applied: "已应用",
+    rolled_back: "已回滚",
+    rejected: "已拒绝",
+    failed: "失败",
+  }
+  return map[patchStatus.value] || patchStatus.value
+})
+
 const mcpServices = computed(() => mcpStore.services || [])
 const connectedCount = computed(() => mcpStore.connectedCount || 0)
+
+function handleChangedFileClick(filePath: string, absolutePath?: string) {
+  if (absolutePath) {
+    workspaceStore.selectFile(absolutePath, filePath)
+  } else if (projectPath.value) {
+    const normalized = filePath.replace(/\\/g, "/")
+    const full = projectPath.value.replace(/\\/g, "/").replace(/\/+$/, "") + "/" + normalized.replace(/^\/+/, "")
+    workspaceStore.selectFile(full, filePath)
+  }
+}
+
+function handleTabClick(filePath: string) {
+  workspaceStore.selectFile(filePath)
+}
 </script>
 
 <template>
@@ -71,15 +110,18 @@ const connectedCount = computed(() => mcpStore.connectedCount || 0)
             </div>
             <div class="v02-card__row">
               <span class="v02-card__label">当前文件</span>
-              <span class="v02-card__value">{{ activeFile }}</span>
+              <span class="v02-card__value" :class="{ 'v02-card__clickable': activeFile !== '未选择' }" @click="activeFile !== '未选择' && workspaceStore.activeTab?.filePath && handleTabClick(workspaceStore.activeTab.filePath)">{{ activeFile }}</span>
             </div>
             <div class="v02-card__row">
-              <span class="v02-card__label">已打开标签</span>
-              <span class="v02-card__value">{{ openTabs }}</span>
+              <span class="v02-card__label">已打开标签 ({{ openTabs }})</span>
+            </div>
+            <div v-for="tabPath in openTabNames" :key="tabPath" class="v02-card__tab-row" @click="handleTabClick(tabPath)">
+              <FileText :size="12" class="v02-card__tab-icon" />
+              <span class="v02-card__tab-name">{{ tabPath }}</span>
             </div>
             <div v-if="activeTask?.patchProposalId" class="v02-card__row">
               <span class="v02-card__label">补丁状态</span>
-              <span class="v02-card__value">{{ patchStatus }}</span>
+              <span class="v02-card__value">{{ patchStatusLabel }}</span>
             </div>
           </div>
         </div>
@@ -91,7 +133,7 @@ const connectedCount = computed(() => mcpStore.connectedCount || 0)
           </div>
           <div class="v02-card__body">
             <div v-if="changedFiles.length === 0" class="v02-card__empty">暂无变更</div>
-            <div v-for="file in changedFiles" :key="file.path" class="v02-card__file-row">
+            <div v-for="file in changedFiles" :key="file.path" class="v02-card__file-row v02-card__clickable" @click="handleChangedFileClick(file.path, file.absolutePath)">
               <FileText :size="13" class="v02-card__file-icon" />
               <span class="v02-card__file-path">{{ file.path }}</span>
               <span class="v02-card__file-tag" :class="`v02-card__file-tag--${file.status}`">{{ file.status }}</span>
@@ -103,6 +145,7 @@ const connectedCount = computed(() => mcpStore.connectedCount || 0)
           <div class="v02-card__header">
             <Diff :size="14" />
             <span>Diff 摘要</span>
+            <span v-if="diffHunks.length > 1" class="v02-card__badge">{{ diffHunks.length }} 文件</span>
           </div>
           <div class="v02-card__body">
             <div v-if="!diffStats" class="v02-card__empty">暂无 Diff / 当前任务尚未生成可审查变更</div>
@@ -111,6 +154,21 @@ const connectedCount = computed(() => mcpStore.connectedCount || 0)
                 <span class="v02-card__diff-added">+{{ diffStats.added }}</span>
                 <span class="v02-card__diff-removed">-{{ diffStats.removed }}</span>
                 <span class="v02-card__diff-files">{{ diffStats.files }} 个文件变更</span>
+              </div>
+              <!-- 多文件 Diff 选择器 -->
+              <div v-if="diffHunks.length > 1" class="v02-card__diff-file-select">
+                <button
+                  v-for="hunk in diffHunks"
+                  :key="hunk.filePath"
+                  class="v02-card__diff-file-chip"
+                  :class="{ 'v02-card__diff-file-chip--active': selectedDiffFile === hunk.filePath || (!selectedDiffFile && hunk === diffHunks[0]) }"
+                  @click="selectedDiffFile = hunk.filePath"
+                >
+                  {{ hunk.filePath }}
+                </button>
+              </div>
+              <div v-if="selectedHunk" class="v02-card__diff-file-label">
+                <FileCode :size="11" /> {{ selectedHunk.filePath }}
               </div>
               <div v-if="diffPreviewLines.length" class="v02-card__diff-preview">
                 <div
@@ -395,5 +453,80 @@ const connectedCount = computed(() => mcpStore.connectedCount || 0)
 .v02-card__tool-status--off {
   background: var(--ls-bg-muted);
   color: var(--ls-text-subtle);
+}
+
+.v02-card__clickable {
+  cursor: pointer;
+  transition: background 120ms;
+}
+
+.v02-card__clickable:hover {
+  background: var(--ls-bg-surface-alpha);
+  border-radius: 4px;
+}
+
+.v02-card__tab-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+  font-size: 11px;
+  color: var(--ls-text-secondary);
+  cursor: pointer;
+  transition: color 120ms;
+}
+
+.v02-card__tab-row:hover {
+  color: var(--ls-text-primary);
+}
+
+.v02-card__tab-icon {
+  color: var(--ls-text-muted);
+  flex-shrink: 0;
+}
+
+.v02-card__tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.v02-card__diff-file-select {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+
+.v02-card__diff-file-chip {
+  padding: 2px 8px;
+  border: 1px solid var(--ls-border-soft);
+  border-radius: 999px;
+  background: var(--ls-bg-muted);
+  color: var(--ls-text-muted);
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  cursor: pointer;
+  transition: all 120ms;
+}
+
+.v02-card__diff-file-chip:hover {
+  border-color: var(--ls-border-default);
+  color: var(--ls-text-secondary);
+}
+
+.v02-card__diff-file-chip--active {
+  border-color: var(--ls-primary);
+  background: var(--ls-primary-soft);
+  color: var(--ls-primary);
+}
+
+.v02-card__diff-file-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ls-text-muted);
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
 }
 </style>

@@ -105,6 +105,7 @@ export interface DiffHunk {
 
 export interface ChangedFile {
   path: string
+  absolutePath?: string
   status: "M" | "A" | "D" | "R" | "new"
   oldContent?: string
   newContent?: string

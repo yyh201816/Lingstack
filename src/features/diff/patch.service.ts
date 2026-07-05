@@ -1,17 +1,14 @@
 import TauriService from "@/services/ipc/tauri.service"
+import { joinProjectPath } from "@/shared/utils/project-path"
 import { generateFileDiff } from "./diff.service"
 import type { PatchApplyRecord, PatchFileChange, PatchProposal, PatchResult } from "./diff.types"
 
 const STORAGE_KEY = "lingstack_patch_proposals"
 
-function normalizePath(path: string): string {
-  return path.replace(/\\/g, "/")
-}
-
-function joinProjectPath(projectPath: string, filePath: string): string {
-  const root = normalizePath(projectPath).replace(/\/+$/, "")
-  const relative = normalizePath(filePath).replace(/^\/+/, "")
-  return `${root}/${relative}`
+export interface PatchDraftInput {
+  filePath: string
+  newContent?: string
+  status?: PatchFileChange["status"]
 }
 
 function generateId(): string {
@@ -31,6 +28,35 @@ function writeProposals(proposals: Record<string, PatchProposal>): void {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(proposals))
 }
 
+async function readExistingFile(fullPath: string): Promise<{ exists: boolean; content: string }> {
+  try {
+    const content = await TauriService.readFile(fullPath)
+    return { exists: true, content }
+  } catch {
+    return { exists: false, content: "" }
+  }
+}
+
+async function restoreAppliedFiles(projectPath: string, appliedFiles: PatchApplyRecord["appliedFiles"]): Promise<void> {
+  for (const file of [...appliedFiles].reverse()) {
+    const fullPath = joinProjectPath(projectPath, file.filePath)
+
+    if (file.status === "A") {
+      await TauriService.deleteFile(fullPath).catch(() => undefined)
+      continue
+    }
+
+    if (file.backupPath) {
+      try {
+        const backupContent = await TauriService.readFile(file.backupPath)
+        await TauriService.writeFile(fullPath, backupContent)
+      } catch {
+        // ignore recovery failures here, the main error will be surfaced
+      }
+    }
+  }
+}
+
 export function getPatchProposal(id?: string): PatchProposal | null {
   if (!id) return null
   return readProposals()[id] ?? null
@@ -45,26 +71,21 @@ export function savePatchProposal(proposal: PatchProposal): void {
 export async function createPatchProposal(input: {
   projectPath: string
   taskId?: string
-  files: Array<{ filePath: string; newContent: string }>
+  files: PatchDraftInput[]
 }): Promise<PatchProposal> {
   const changes: PatchFileChange[] = []
 
-  for (const file of input.files) {
-    const fullPath = joinProjectPath(input.projectPath, file.filePath)
-    let oldContent = ""
-    let status: PatchFileChange["status"] = "M"
+  for (const draft of input.files) {
+    const fullPath = joinProjectPath(input.projectPath, draft.filePath)
+    const existing = await readExistingFile(fullPath)
+    const status = draft.status ?? (existing.exists ? "M" : "A")
+    const newContent = status === "D" ? "" : draft.newContent ?? ""
+    const diff = generateFileDiff(draft.filePath, existing.content, newContent)
 
-    try {
-      oldContent = await TauriService.readFile(fullPath)
-    } catch {
-      status = "A"
-    }
-
-    const diff = generateFileDiff(file.filePath, oldContent, file.newContent)
     changes.push({
-      filePath: file.filePath,
-      oldContent,
-      newContent: file.newContent,
+      filePath: draft.filePath,
+      oldContent: existing.content,
+      newContent,
       status,
       diff,
     })
@@ -95,7 +116,7 @@ export async function applyPatchProposal(proposalId: string): Promise<PatchResul
   }
 
   if (proposal.status === "applied") {
-    return { success: true, proposalId, error: "补丁已经应用" }
+    return { success: true, proposalId }
   }
 
   const appliedFiles: PatchApplyRecord["appliedFiles"] = []
@@ -104,16 +125,23 @@ export async function applyPatchProposal(proposalId: string): Promise<PatchResul
     for (const file of proposal.files) {
       const fullPath = joinProjectPath(proposal.projectPath, file.filePath)
       const backupPath = `${fullPath}.lingstack-backup`
+      const current = await readExistingFile(fullPath)
 
-      try {
-        const currentContent = await TauriService.readFile(fullPath)
-        await TauriService.writeFile(backupPath, currentContent)
-        appliedFiles.push({ filePath: file.filePath, backupPath })
-      } catch {
-        appliedFiles.push({ filePath: file.filePath })
+      if (current.exists) {
+        await TauriService.writeFile(backupPath, current.content)
       }
 
-      await TauriService.writeFile(fullPath, file.newContent)
+      if (file.status === "D") {
+        await TauriService.deleteFile(fullPath)
+      } else {
+        await TauriService.writeFile(fullPath, file.newContent)
+      }
+
+      appliedFiles.push({
+        filePath: file.filePath,
+        status: file.status,
+        backupPath: current.exists ? backupPath : undefined,
+      })
     }
 
     const record: PatchApplyRecord = {
@@ -129,6 +157,7 @@ export async function applyPatchProposal(proposalId: string): Promise<PatchResul
 
     return { success: true, proposalId, record }
   } catch (error) {
+    await restoreAppliedFiles(proposal.projectPath, appliedFiles)
     proposal.status = "failed"
     proposal.error = String(error)
     savePatchProposal(proposal)
@@ -145,6 +174,12 @@ export async function rollbackPatchProposal(proposalId: string): Promise<PatchRe
   try {
     for (const file of proposal.files) {
       const fullPath = joinProjectPath(proposal.projectPath, file.filePath)
+
+      if (file.status === "A") {
+        await TauriService.deleteFile(fullPath)
+        continue
+      }
+
       await TauriService.writeFile(fullPath, file.oldContent)
     }
 
@@ -169,7 +204,7 @@ export async function applyPatch(
 ): Promise<PatchResult> {
   const proposal = await createPatchProposal({
     projectPath,
-    files: [{ filePath, newContent: content }],
+    files: [{ filePath, newContent: content, status: "M" }],
   })
   return applyPatchProposal(proposal.id)
 }

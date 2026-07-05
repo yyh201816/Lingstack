@@ -80,7 +80,16 @@ export async function writeFile(filePath: string, content: string): Promise<void
     return invoke("write_file", { path: filePath, content })
   }
 
-  console.log("[Mock FS] writeFile:", filePath, `${content.length} chars`)
+  MOCK_FILES[filePath] = content
+}
+
+export async function deleteFile(filePath: string): Promise<void> {
+  if (isTauriEnv()) {
+    const invoke = await getInvoke()
+    return invoke("delete_file", { path: filePath })
+  }
+
+  delete MOCK_FILES[filePath]
 }
 
 export async function checkPath(targetPath: string): Promise<boolean> {
@@ -114,6 +123,7 @@ export const TauriService = {
   listDir,
   readFile,
   writeFile,
+  deleteFile,
   checkPath,
   getAppInfo,
   setWindowTitle,

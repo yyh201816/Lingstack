@@ -122,6 +122,23 @@ export const useWorkspaceStore = defineStore("workspace", () => {
 
   function setEditedContent(filePath: string, content: string) {
     editedContentMap.value[filePath] = content
+    fileContentCache.value[filePath] = content
+
+    const tab = tabs.value.find((item) => item.filePath === filePath)
+    if (tab) {
+      tab.content = content
+      tab.isDirty = true
+    }
+  }
+
+  function setFileContent(filePath: string, content: string) {
+    fileContentCache.value[filePath] = content
+
+    const tab = tabs.value.find((item) => item.filePath === filePath)
+    if (tab) {
+      tab.content = content
+      tab.isDirty = false
+    }
   }
 
   function onSaved(filePath: string, content: string) {
@@ -181,6 +198,34 @@ export const useWorkspaceStore = defineStore("workspace", () => {
     saveSession()
   }
 
+  function updateOpenFileContent(filePath: string, content: string) {
+    fileContentCache.value[filePath] = content
+    editedContentMap.value[filePath] = content
+
+    const tab = tabs.value.find((item) => item.filePath === filePath)
+    if (tab) {
+      tab.content = content
+      tab.isDirty = false
+    }
+  }
+
+  function removeOpenFileByPath(filePath: string) {
+    delete editedContentMap.value[filePath]
+    delete fileContentCache.value[filePath]
+
+    const tab = tabs.value.find((item) => item.filePath === filePath)
+    if (tab) {
+      closeTab(tab.id)
+    }
+  }
+
+  function getFileContent(filePath: string): string {
+    return editedContentMap.value[filePath]
+      ?? fileContentCache.value[filePath]
+      ?? tabs.value.find((item) => item.filePath === filePath)?.content
+      ?? ""
+  }
+
   return {
     activeProject,
     activeProjectName,
@@ -200,9 +245,13 @@ export const useWorkspaceStore = defineStore("workspace", () => {
     switchTab,
     markDirty,
     setEditedContent,
+    setFileContent,
     onSaved,
     saveSession,
     restoreTabs,
     setProjectPath,
+    updateOpenFileContent,
+    removeOpenFileByPath,
+    getFileContent,
   }
 })

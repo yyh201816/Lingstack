@@ -9,6 +9,10 @@ import {
 } from "@/services/chat/chat.service"
 import type { AgentTask, AgentTaskType, ChangedFile, DiffSummary } from "./agent-runtime.types"
 import { useAgentTaskStore } from "./agent-task.store"
+import { useWorkspaceStore } from "@/features/workspace/store/workspace.store"
+import { joinProjectPath, getProjectDisplayName, toRelativeProjectPath } from "@/shared/utils/project-path"
+
+// ── types ─────────────────────────────────────────
 
 interface RunTaskOptions {
   projectPath?: string
@@ -29,36 +33,23 @@ interface ParsedPatchFile {
   newContent: string
 }
 
+// ── helpers ───────────────────────────────────────
+
 function normalizePath(path: string): string {
   return path.replace(/\\/g, "/")
-}
-
-function getProjectDisplayName(projectPath?: string): string {
-  if (!projectPath) return "未打开项目"
-  return normalizePath(projectPath).split("/").filter(Boolean).pop() || "未命名项目"
 }
 
 function makeTitle(type: AgentTaskType, userRequest: string, projectName?: string): string {
   const prefix = projectName ? `${projectName}：` : ""
   const fallback = userRequest.trim().slice(0, 30)
 
-  if (type === "self_repair") return `${prefix}自修复分析`
-  if (type === "code_modify") return prefix + (fallback || "代码修改")
-  if (type === "context_scan") return `${prefix}项目上下文分析`
-  if (type === "chat") return fallback || "新对话"
-  return prefix + (fallback || "新任务")
-}
-
-function toRelativeFilePath(projectPath: string | undefined, filePath: string): string {
-  if (!projectPath) return normalizePath(filePath)
-
-  const normalizedProject = normalizePath(projectPath).replace(/\/+$/, "")
-  const normalizedFile = normalizePath(filePath)
-  if (normalizedFile.startsWith(`${normalizedProject}/`)) {
-    return normalizedFile.slice(normalizedProject.length + 1)
+  switch (type) {
+    case "self_repair": return `${prefix}自修复分析`
+    case "code_modify": return prefix + (fallback || "代码修改")
+    case "context_scan": return `${prefix}项目上下文分析`
+    case "chat": return fallback || "新对话"
+    default: return prefix + (fallback || "新任务")
   }
-
-  return normalizedFile.replace(/^\/+/, "")
 }
 
 function buildWorkspaceContext(taskId: string, userRequest: string, opts: RunTaskOptions): WorkspaceContext {
@@ -86,6 +77,14 @@ function proposalToTaskDiff(proposal: PatchProposal): { diff: DiffSummary; chang
     })),
   )
 
+  const changedFiles: ChangedFile[] = proposal.files.map((file) => ({
+    path: file.filePath,
+    absolutePath: proposal.projectPath ? joinProjectPath(proposal.projectPath, file.filePath) : file.filePath,
+    status: file.status,
+    oldContent: file.oldContent,
+    newContent: file.newContent,
+  }))
+
   return {
     diff: {
       added: proposal.summary.added,
@@ -93,14 +92,11 @@ function proposalToTaskDiff(proposal: PatchProposal): { diff: DiffSummary; chang
       files: proposal.summary.files,
       hunks,
     },
-    changedFiles: proposal.files.map((file) => ({
-      path: file.filePath,
-      status: file.status,
-      oldContent: file.oldContent,
-      newContent: file.newContent,
-    })),
+    changedFiles,
   }
 }
+
+// ── context collection ────────────────────────────
 
 async function collectProjectOverview(projectPath?: string): Promise<ProjectOverview> {
   if (!projectPath) {
@@ -149,6 +145,29 @@ async function readImportantFiles(filePaths: string[]): Promise<string> {
 
   return chunks.join("\n\n")
 }
+
+async function buildTaskContext(projectPath?: string): Promise<ProjectOverview & { contextSummary: string }> {
+  const overview = await collectProjectOverview(projectPath)
+  const importantFilesText = await readImportantFiles(overview.importantFiles)
+
+  return {
+    ...overview,
+    contextSummary: importantFilesText
+      ? `${overview.summary}\n\n关键文件摘录：\n${importantFilesText}`
+      : overview.summary,
+  }
+}
+
+function buildContextNotice(task: AgentTask, overview: ProjectOverview): string {
+  if (!task.projectPath) {
+    return "已读取基础任务上下文。当前未打开项目，后续分析将仅基于你的描述。"
+  }
+
+  const importantCount = overview.importantFiles.length
+  return `已读取项目上下文：${task.projectName || getProjectDisplayName(task.projectPath)}，顶层条目 ${overview.topLevelEntryCount} 个，关键文件 ${importantCount} 个。`
+}
+
+// ── prompt builders ────────────────────────────────
 
 function buildPlanPrompt(type: AgentTaskType, request: string, opts: RunTaskOptions, contextSummary: string): string {
   const projectInfo = opts.projectPath
@@ -217,6 +236,8 @@ function buildPatchPrompt(task: AgentTask, contextSummary: string): string {
   ].join("\n")
 }
 
+// ── patch parsing ──────────────────────────────────
+
 function parsePatchFromText(text: string, opts: RunTaskOptions): ParsedPatchFile[] {
   const match = text.match(/```lingstack_patch\s*([\s\S]*?)```/)
   if (!match) return []
@@ -231,14 +252,14 @@ function parsePatchFromText(text: string, opts: RunTaskOptions): ParsedPatchFile
 
     return files
       .map((file: Record<string, unknown>) => ({
-        filePath: toRelativeFilePath(opts.projectPath, String(file.path || file.filePath || "")),
+        filePath: toRelativeProjectPath(opts.projectPath, String(file.path || file.filePath || "")),
         newContent: typeof file.content === "string"
           ? file.content
           : typeof file.newContent === "string"
             ? file.newContent
             : "",
       }))
-      .filter((file: ParsedPatchFile) => file.filePath && file.newContent.length > 0)
+      .filter((file: ParsedPatchFile) => file.filePath && file.filePath !== "未选择" && file.newContent.length > 0)
   } catch {
     return []
   }
@@ -247,6 +268,8 @@ function parsePatchFromText(text: string, opts: RunTaskOptions): ParsedPatchFile
 function stripPatchBlock(text: string): string {
   return text.replace(/```lingstack_patch[\s\S]*?```/g, "").trim()
 }
+
+// ── LLM streaming ──────────────────────────────────
 
 async function streamLLM(
   messages: ChatMessage[],
@@ -276,6 +299,8 @@ async function streamLLM(
   return fullText
 }
 
+// ── fallback text ──────────────────────────────────
+
 function fallbackPlan(type: AgentTaskType, request: string, projectName?: string): string {
   if (type === "self_repair") {
     return [
@@ -299,33 +324,40 @@ function fallbackAnalysis(projectName?: string, hasProject = false): string {
   if (hasProject) {
     return `已完成第一轮分析。当前项目：${projectName || "未命名项目"}。如需继续修改，我可以下一步生成补丁提案。`
   }
-
   return "已收到任务。打开项目后，我可以读取上下文并继续生成更精确的计划或补丁。"
 }
 
-function buildContextNotice(task: AgentTask, overview: ProjectOverview): string {
-  if (!task.projectPath) {
-    return "已读取基础任务上下文。当前未打开项目，后续分析将仅基于你的描述。"
-  }
+// ── editor sync helpers ────────────────────────────
 
-  const importantCount = overview.importantFiles.length
-  return `已读取项目上下文：${task.projectName || getProjectDisplayName(task.projectPath)}，顶层条目 ${overview.topLevelEntryCount} 个，关键文件 ${importantCount} 个。`
-}
-
-async function buildTaskContext(projectPath?: string): Promise<ProjectOverview & { contextSummary: string }> {
-  const overview = await collectProjectOverview(projectPath)
-  const importantFilesText = await readImportantFiles(overview.importantFiles)
-
-  return {
-    ...overview,
-    contextSummary: importantFilesText
-      ? `${overview.summary}\n\n关键文件摘录：\n${importantFilesText}`
-      : overview.summary,
+function syncEditorAfterApply(workspaceStore: ReturnType<typeof useWorkspaceStore>, changedFiles: ChangedFile[]): void {
+  for (const file of changedFiles) {
+    if (file.newContent !== undefined && file.path) {
+      workspaceStore.setFileContent(
+        file.absolutePath || file.path,
+        file.newContent,
+      )
+    }
   }
 }
+
+function syncEditorAfterRollback(workspaceStore: ReturnType<typeof useWorkspaceStore>, changedFiles: ChangedFile[]): void {
+  for (const file of changedFiles) {
+    if (file.oldContent !== undefined && file.path) {
+      workspaceStore.setFileContent(
+        file.absolutePath || file.path,
+        file.oldContent,
+      )
+    }
+  }
+}
+
+// ── main service ───────────────────────────────────
 
 export function useAgentTaskService() {
   const store = useAgentTaskStore()
+  const workspaceStore = useWorkspaceStore()
+
+  // ── runTask: 主任务流水线 ───────────────────────
 
   async function runTask(type: AgentTaskType, userRequest: string, opts: RunTaskOptions = {}): Promise<AgentTask> {
     const title = makeTitle(type, userRequest, opts.projectName)
@@ -334,6 +366,7 @@ export function useAgentTaskService() {
     store.addMessage(taskId, "user", userRequest)
 
     try {
+      // Step 1: 读取项目上下文
       store.updateTaskStatus(taskId, "building_context")
       const contextStep = store.addStep(taskId, "读取项目上下文")
       store.updateStep(taskId, contextStep.id, "running")
@@ -342,6 +375,7 @@ export function useAgentTaskService() {
       store.updateStep(taskId, contextStep.id, "done")
       store.addMessage(taskId, "system", buildContextNotice(task, contextBundle))
 
+      // Step 2: 生成执行计划
       store.updateTaskStatus(taskId, "planning")
       const planStep = store.addStep(taskId, "生成执行计划")
       store.updateStep(taskId, planStep.id, "running")
@@ -358,6 +392,7 @@ export function useAgentTaskService() {
       store.addMessage(taskId, "assistant", planText)
       store.updateStep(taskId, planStep.id, "done")
 
+      // Step 3: 执行分析
       store.updateTaskStatus(taskId, "executing_tool")
       const executionStep = store.addStep(taskId, "生成分析结果")
       store.updateStep(taskId, executionStep.id, "running")
@@ -379,6 +414,7 @@ export function useAgentTaskService() {
 
       store.updateStep(taskId, executionStep.id, "done")
 
+      // Step 4: 生成补丁（如 LLM 输出了 patch block）
       if (opts.projectPath && parsedPatch.length > 0) {
         store.updateTaskStatus(taskId, "generating_diff")
         const diffStep = store.addStep(taskId, "生成补丁提案")
@@ -387,16 +423,20 @@ export function useAgentTaskService() {
         const proposal = await createPatchProposal({
           projectPath: opts.projectPath,
           taskId,
-          files: parsedPatch,
+          files: parsedPatch.map((f) => ({
+            filePath: f.filePath,
+            newContent: f.newContent,
+          })),
         })
         const { diff, changedFiles } = proposalToTaskDiff(proposal)
         store.setPatchProposal(taskId, proposal.id, diff, changedFiles)
-        store.addMessage(taskId, "system", `已生成真实补丁提案：${proposal.id}，等待你确认后应用。`)
+        store.addMessage(taskId, "system", `已生成真实补丁提案：${proposal.id}，涉及 ${changedFiles.length} 个文件，等待你确认后应用。`)
         store.updateStep(taskId, diffStep.id, "done")
         store.updateTaskStatus(taskId, "waiting_confirm")
         return task
       }
 
+      // 无 patch → analysis_done
       store.addMessage(taskId, "system", "分析完成，可继续生成补丁。当前还没有可审查的 Diff。")
       store.updateTaskStatus(taskId, "analysis_done")
       return task
@@ -406,6 +446,19 @@ export function useAgentTaskService() {
       throw error
     }
   }
+
+  // ── runChatTask: 简单对话 ────────────────────────
+
+  async function runChatTask(
+    text: string,
+    projectPath?: string,
+    projectName?: string,
+    threadId?: string,
+  ): Promise<AgentTask> {
+    return runTask("chat", text, { projectPath, projectName, threadId })
+  }
+
+  // ── continueGeneratePatch: 从 analysis_done 继续 ─
 
   async function continueGeneratePatch(taskId: string): Promise<void> {
     const task = store.tasks.find((item) => item.id === taskId)
@@ -457,12 +510,15 @@ export function useAgentTaskService() {
         const proposal = await createPatchProposal({
           projectPath: task.projectPath,
           taskId,
-          files: parsedPatch,
+          files: parsedPatch.map((f) => ({
+            filePath: f.filePath,
+            newContent: f.newContent,
+          })),
         })
         const { diff, changedFiles } = proposalToTaskDiff(proposal)
         store.setPatchProposal(taskId, proposal.id, diff, changedFiles)
         store.updateStep(taskId, step.id, "done")
-        store.addMessage(taskId, "system", `已生成新的补丁提案：${proposal.id}，可以前往审查并确认应用。`)
+        store.addMessage(taskId, "system", `已生成新的补丁提案：${proposal.id}，涉及 ${changedFiles.length} 个文件，可以前往审查并确认应用。`)
         store.updateTaskStatus(taskId, "waiting_confirm")
         return
       }
@@ -477,6 +533,8 @@ export function useAgentTaskService() {
     }
   }
 
+  // ── approveTask: 确认并应用补丁 ──────────────────
+
   async function approveTask(taskId: string): Promise<void> {
     const task = store.tasks.find((item) => item.id === taskId)
     if (!task?.patchProposalId || task.status !== "waiting_confirm") return
@@ -486,10 +544,11 @@ export function useAgentTaskService() {
       | undefined
 
     if (confirm) {
+      const fileList = task.changedFiles.map((f) => `  ${f.status}  ${f.path}`).join("\n")
       const ok = await confirm(
         "应用补丁",
-        "灵栈将把当前补丁写入本地项目文件。",
-        `提案：${task.patchProposalId}\n文件：${task.changedFiles.map((file) => file.path).join("\n")}`,
+        `灵栈将把当前补丁写入本地项目文件（${task.changedFiles.length} 个文件）。`,
+        `提案：${task.patchProposalId}\n${fileList}`,
       )
       if (!ok) return
     }
@@ -498,20 +557,40 @@ export function useAgentTaskService() {
     const step = store.addStep(taskId, "应用补丁")
     store.updateStep(taskId, step.id, "running")
 
-    const result = await applyPatchProposal(task.patchProposalId)
-    if (!result.success) {
-      store.updatePatchStatus(taskId, "failed", result.error)
-      store.updateStep(taskId, step.id, "failed", result.error)
-      store.updateTaskStatus(taskId, "failed", result.error)
-      store.addMessage(taskId, "system", `补丁应用失败：${result.error || "未知错误"}`)
-      return
-    }
+    try {
+      const result = await applyPatchProposal(task.patchProposalId)
+      if (!result.success) {
+        throw new Error(result.error || "补丁应用失败")
+      }
 
-    store.updatePatchStatus(taskId, "applied")
-    store.updateStep(taskId, step.id, "done")
-    store.updateTaskStatus(taskId, "completed")
-    store.addMessage(taskId, "system", "补丁已应用到本地文件。你仍然可以从任务区执行回滚。")
+      store.updatePatchStatus(taskId, "applied")
+      store.updateStep(taskId, step.id, "done")
+      store.addMessage(taskId, "system", `补丁已成功应用到本地项目文件（${task.changedFiles.length} 个文件）。`)
+
+      // 同步编辑器内容
+      syncEditorAfterApply(workspaceStore, task.changedFiles)
+
+      store.updateTaskStatus(taskId, "completed")
+    } catch (error) {
+      store.updateStep(taskId, step.id, "failed", String(error))
+      store.updatePatchStatus(taskId, "failed", String(error))
+      store.updateTaskStatus(taskId, "failed", String(error))
+      store.addMessage(taskId, "system", `补丁应用失败：${String(error)}`)
+    }
   }
+
+  // ── rejectTask: 拒绝补丁 ─────────────────────────
+
+  function rejectTask(taskId: string): void {
+    const task = store.tasks.find((item) => item.id === taskId)
+    if (!task) return
+
+    store.updatePatchStatus(taskId, "rejected")
+    store.updateTaskStatus(taskId, "failed", "补丁已被用户拒绝")
+    store.addMessage(taskId, "system", "补丁已被拒绝。你可以调整需求后重新发起任务。")
+  }
+
+  // ── rollbackTask: 回滚已应用的补丁 ───────────────
 
   async function rollbackTask(taskId: string): Promise<void> {
     const task = store.tasks.find((item) => item.id === taskId)
@@ -522,10 +601,11 @@ export function useAgentTaskService() {
       | undefined
 
     if (confirm) {
+      const fileList = task.changedFiles.map((f) => `  ${f.path}`).join("\n")
       const ok = await confirm(
         "回滚补丁",
-        "灵栈将恢复补丁应用前的文件内容。",
-        `提案：${task.patchProposalId}\n文件：${task.changedFiles.map((file) => file.path).join("\n")}`,
+        `灵栈将把以下 ${task.changedFiles.length} 个文件恢复到补丁应用前的状态。`,
+        `提案：${task.patchProposalId}\n${fileList}`,
       )
       if (!ok) return
     }
@@ -534,66 +614,34 @@ export function useAgentTaskService() {
     const step = store.addStep(taskId, "回滚补丁")
     store.updateStep(taskId, step.id, "running")
 
-    const result = await rollbackPatchProposal(task.patchProposalId)
-    if (!result.success) {
-      store.updatePatchStatus(taskId, "failed", result.error)
-      store.updateStep(taskId, step.id, "failed", result.error)
-      store.updateTaskStatus(taskId, "failed", result.error)
-      store.addMessage(taskId, "system", `补丁回滚失败：${result.error || "未知错误"}`)
-      return
+    try {
+      const result = await rollbackPatchProposal(task.patchProposalId)
+      if (!result.success) {
+        throw new Error(result.error || "回滚失败")
+      }
+
+      store.updatePatchStatus(taskId, "rolled_back")
+      store.updateStep(taskId, step.id, "done")
+      store.addMessage(taskId, "system", `补丁已回滚，${task.changedFiles.length} 个文件已恢复到应用前的状态。`)
+
+      // 同步编辑器：恢复到旧内容
+      syncEditorAfterRollback(workspaceStore, task.changedFiles)
+
+      store.updateTaskStatus(taskId, "completed")
+    } catch (error) {
+      store.updateStep(taskId, step.id, "failed", String(error))
+      store.updatePatchStatus(taskId, "failed", String(error))
+      store.updateTaskStatus(taskId, "failed", String(error))
+      store.addMessage(taskId, "system", `补丁回滚失败：${String(error)}`)
     }
-
-    store.updatePatchStatus(taskId, "rolled_back")
-    store.updateStep(taskId, step.id, "done")
-    store.updateTaskStatus(taskId, "completed")
-    store.addMessage(taskId, "system", "补丁已回滚，文件内容已恢复。")
   }
 
-  function rejectTask(taskId: string): void {
-    const task = store.tasks.find((item) => item.id === taskId)
-    if (!task) return
-
-    store.updatePatchStatus(taskId, "rejected")
-    store.updateTaskStatus(taskId, "cancelled")
-    store.addMessage(taskId, "system", "已拒绝本次补丁提案，未写入任何文件。")
+  return {
+    runTask,
+    runChatTask,
+    approveTask,
+    rejectTask,
+    rollbackTask,
+    continueGeneratePatch,
   }
-
-  async function runChatTask(
-    userRequest: string,
-    projectPath?: string,
-    projectName?: string,
-    threadId?: string,
-  ): Promise<AgentTask> {
-    const task = store.createTask("chat", userRequest.slice(0, 40) || "新对话", userRequest, {
-      projectPath,
-      projectName,
-      threadId,
-    })
-    store.addMessage(task.id, "user", userRequest)
-    store.updateTaskStatus(task.id, "planning")
-
-    const context = buildWorkspaceContext(task.id, userRequest, { projectPath, projectName, threadId })
-
-    if (isConfigured()) {
-      const reply = await streamLLM(
-        [{ role: "user", content: userRequest }],
-        context,
-        () => "模型响应失败，请检查模型配置后重试。",
-      )
-      store.addMessage(task.id, "assistant", reply)
-    } else {
-      store.addMessage(
-        task.id,
-        "assistant",
-        projectPath
-          ? `已收到任务。当前已关联项目：${projectName || getProjectDisplayName(projectPath)}。配置 API Key 后我可以继续做深度分析。`
-          : "已收到消息。配置 API Key 后即可获得真实 AI 回复。",
-      )
-    }
-
-    store.updateTaskStatus(task.id, "completed")
-    return task
-  }
-
-  return { runTask, continueGeneratePatch, approveTask, rejectTask, rollbackTask, runChatTask }
 }

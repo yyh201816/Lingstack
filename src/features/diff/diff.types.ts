@@ -31,7 +31,7 @@ export interface PatchFileChange {
   filePath: string
   oldContent: string
   newContent: string
-  status: "M" | "A"
+  status: "M" | "A" | "D"
   diff: FileDiff
 }
 
@@ -56,6 +56,7 @@ export interface PatchApplyRecord {
   proposalId: string
   appliedFiles: Array<{
     filePath: string
+    status: "M" | "A" | "D"
     backupPath?: string
   }>
   appliedAt: string
