@@ -1,6 +1,6 @@
 import { defineStore } from "pinia"
 import { computed, ref } from "vue"
-import type { AgentTask, AgentTaskStatus, AgentTaskStep, AgentTaskType, ChangedFile, DiffSummary } from "./agent-runtime.types"
+import type { AgentTask, AgentTaskStatus, AgentTaskStep, AgentTaskType, ChangedFile, DiffSummary, ToolCallRecord } from "./agent-runtime.types"
 import { runtimeEventBus } from "./runtime-event-bus"
 
 const STORAGE_KEY = "lingstack_agent_tasks"
@@ -156,7 +156,7 @@ export const useAgentTaskStore = defineStore("agentTask", () => {
     }
   }
 
-  function addMessage(id: string, role: "user" | "assistant" | "system" | "tool", content: string): void {
+  function addMessage(id: string, role: "user" | "assistant" | "system" | "tool", content: string, meta?: Record<string, unknown>): void {
     const task = tasks.value.find((item) => item.id === id)
     if (!task) return
 
@@ -165,10 +165,44 @@ export const useAgentTaskStore = defineStore("agentTask", () => {
       role,
       content,
       createdAt: new Date().toISOString(),
+      meta,
     })
     task.updatedAt = new Date().toISOString()
     persist()
     runtimeEventBus.emit("message_added", id, { role, threadId: task.threadId })
+  }
+
+  function addToolCall(id: string, toolName: string, params: Record<string, unknown>): ToolCallRecord | null {
+    const task = tasks.value.find((item) => item.id === id)
+    if (!task) return null
+
+    const record: ToolCallRecord = {
+      id: generateId("tool"),
+      toolName,
+      params,
+      status: "running",
+      startedAt: new Date().toISOString(),
+    }
+
+    task.toolCalls.push(record)
+    task.updatedAt = new Date().toISOString()
+    persist()
+    return record
+  }
+
+  function updateToolCall(id: string, recordId: string, patch: Partial<Pick<ToolCallRecord, "status" | "result" | "error">>): void {
+    const task = tasks.value.find((item) => item.id === id)
+    if (!task) return
+
+    const record = task.toolCalls.find((item) => item.id === recordId)
+    if (!record) return
+
+    Object.assign(record, patch)
+    if (patch.status === "done" || patch.status === "failed") {
+      record.completedAt = new Date().toISOString()
+    }
+    task.updatedAt = new Date().toISOString()
+    persist()
   }
 
   function setDiff(id: string, diff: DiffSummary, changedFiles: ChangedFile[]): void {
@@ -236,6 +270,8 @@ export const useAgentTaskStore = defineStore("agentTask", () => {
     addStep,
     updateStep,
     addMessage,
+    addToolCall,
+    updateToolCall,
     setDiff,
     setPatchProposal,
     updatePatchStatus,

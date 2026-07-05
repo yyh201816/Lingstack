@@ -76,6 +76,7 @@ export interface AgentMessage {
   createdAt: string
   streaming?: boolean
   error?: boolean
+  meta?: Record<string, unknown>
 }
 
 export interface ToolCallRecord {

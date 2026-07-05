@@ -11,6 +11,7 @@ import type { AgentTask, AgentTaskType, ChangedFile, DiffSummary } from "./agent
 import { useAgentTaskStore } from "./agent-task.store"
 import { useWorkspaceStore } from "@/features/workspace/store/workspace.store"
 import { joinProjectPath, getProjectDisplayName, toRelativeProjectPath } from "@/shared/utils/project-path"
+import { executeToolCall, getToolPromptText, parseToolCallFromText } from "@/features/tool-runtime/tool-router"
 
 // ── types ─────────────────────────────────────────
 
@@ -31,6 +32,11 @@ interface ProjectOverview {
 interface ParsedPatchFile {
   filePath: string
   newContent: string
+}
+
+interface ToolLoopResult {
+  text: string
+  patchFiles: ParsedPatchFile[]
 }
 
 // ── helpers ───────────────────────────────────────
@@ -62,6 +68,22 @@ function buildWorkspaceContext(taskId: string, userRequest: string, opts: RunTas
     taskGoal: userRequest,
     includeFileContent: false,
   }
+}
+
+function buildToolRuntimeRules(opts: RunTaskOptions): string {
+  return [
+    "工具调用规则：",
+    "1. 不要假装已经调用工具。需要读取项目或文件时，必须输出 tool_call。",
+    "2. tool_call 支持格式：```tool_call\n{\"toolName\":\"read_active_file\",\"params\":{}}\n``` 或 <tool_call>{...}</tool_call>。",
+    "3. 当前文件未选择时，不要调用 read_active_file，优先调用 list_dir 或 search_files。",
+    "4. 工具调用后等待 Runtime 返回结果，再继续分析。",
+    "5. 只有掌握完整文件内容时，才输出 lingstack_patch。",
+    "",
+    opts.activeFile ? `当前活动文件：${opts.activeFile}` : "当前活动文件：未选择",
+    "",
+    "可用工具：",
+    getToolPromptText(),
+  ].join("\n")
 }
 
 function proposalToTaskDiff(proposal: PatchProposal): { diff: DiffSummary; changedFiles: ChangedFile[] } {
@@ -185,6 +207,8 @@ function buildPlanPrompt(type: AgentTaskType, request: string, opts: RunTaskOpti
     `用户任务：${request}`,
     "",
     `项目上下文：\n${contextSummary}`,
+    "",
+    buildToolRuntimeRules(opts),
   ].join("\n")
 }
 
@@ -203,6 +227,8 @@ function buildExecutionPrompt(request: string, opts: RunTaskOptions, contextSumm
     opts.activeFile ? `当前文件：${opts.activeFile}` : "当前文件：未选择",
     "",
     `项目上下文：\n${contextSummary}`,
+    "",
+    buildToolRuntimeRules(opts),
     "",
     `用户任务：${request}`,
   ].join("\n")
@@ -233,6 +259,14 @@ function buildPatchPrompt(task: AgentTask, contextSummary: string): string {
     latestAssistantMessages ? `已有分析：\n${latestAssistantMessages}` : "已有分析：暂无",
     "",
     `项目上下文：\n${contextSummary}`,
+    "",
+    buildToolRuntimeRules({
+      projectPath: task.projectPath,
+      projectName: task.projectName,
+      activeFile: task.activeFile,
+      modelName: task.modelName,
+      threadId: task.threadId,
+    }),
   ].join("\n")
 }
 
@@ -269,6 +303,18 @@ function stripPatchBlock(text: string): string {
   return text.replace(/```lingstack_patch[\s\S]*?```/g, "").trim()
 }
 
+function stripToolCallBlock(text: string): string {
+  return text
+    .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
+    .replace(/```tool_call[\s\S]*?```/g, "")
+    .trim()
+}
+
+function summarizeToolResult(result: string, maxLength = 900): string {
+  const clean = result.trim()
+  return clean.length > maxLength ? `${clean.slice(0, maxLength)}\n... 已截断` : clean
+}
+
 // ── LLM streaming ──────────────────────────────────
 
 async function streamLLM(
@@ -297,6 +343,98 @@ async function streamLLM(
   }
 
   return fullText
+}
+
+async function runAgentToolLoop(
+  taskStore: ReturnType<typeof useAgentTaskStore>,
+  workspace: ReturnType<typeof useWorkspaceStore>,
+  taskId: string,
+  initialMessages: ChatMessage[],
+  workspaceContext: WorkspaceContext,
+  opts: RunTaskOptions,
+  fallback: () => string,
+): Promise<ToolLoopResult> {
+  const messages: ChatMessage[] = [...initialMessages]
+  let latestText = ""
+
+  for (let index = 0; index < 3; index += 1) {
+    latestText = isConfigured()
+      ? await streamLLM(messages, workspaceContext, fallback)
+      : fallback()
+
+    const toolCall = parseToolCallFromText(latestText)
+    if (!toolCall) break
+
+    const visibleText = stripToolCallBlock(stripPatchBlock(latestText))
+    if (visibleText) {
+      taskStore.addMessage(taskId, "assistant", visibleText)
+    }
+
+    taskStore.updateTaskStatus(taskId, "waiting_tool")
+    const record = taskStore.addToolCall(taskId, toolCall.toolName, toolCall.params)
+    taskStore.addMessage(
+      taskId,
+      "tool",
+      `工具调用：${toolCall.toolName}`,
+      {
+        kind: "tool_call",
+        toolName: toolCall.toolName,
+        status: "running",
+        params: toolCall.params,
+      },
+    )
+    taskStore.updateTaskStatus(taskId, "executing_tool")
+
+    const activeFileContent = opts.activeFile ? workspace.getFileContent(opts.activeFile) : undefined
+    const result = await executeToolCall({
+      ...toolCall,
+      taskId,
+      projectPath: opts.projectPath,
+      activeFilePath: opts.activeFile,
+      activeFileContent,
+    })
+
+    const resultText = result.success
+      ? summarizeToolResult(result.result || "工具执行完成，但没有返回内容。")
+      : result.error || "工具执行失败"
+
+    if (record) {
+      taskStore.updateToolCall(taskId, record.id, {
+        status: result.success ? "done" : "failed",
+        result: result.success ? resultText : undefined,
+        error: result.success ? undefined : resultText,
+      })
+    }
+
+    taskStore.addMessage(
+      taskId,
+      "tool",
+      resultText,
+      {
+        kind: "tool_result",
+        toolName: toolCall.toolName,
+        status: result.success ? "success" : "failed",
+        params: toolCall.params,
+        duration: result.duration,
+      },
+    )
+
+    messages.push({ role: "assistant", content: latestText })
+    messages.push({
+      role: "user",
+      content: [
+        `工具 ${toolCall.toolName} 已执行。`,
+        `状态：${result.success ? "成功" : "失败"}`,
+        `结果：\n${resultText}`,
+        "请基于工具结果继续分析；如果信息足够且需要改文件，可以输出 lingstack_patch。",
+      ].join("\n"),
+    })
+  }
+
+  return {
+    text: latestText,
+    patchFiles: parsePatchFromText(latestText, opts),
+  }
 }
 
 // ── fallback text ──────────────────────────────────
@@ -397,16 +535,18 @@ export function useAgentTaskService() {
       const executionStep = store.addStep(taskId, "生成分析结果")
       store.updateStep(taskId, executionStep.id, "running")
 
-      const executionText = isConfigured()
-        ? await streamLLM(
-            [{ role: "user", content: buildExecutionPrompt(userRequest, opts, contextBundle.contextSummary) }],
-            workspaceContext,
-            () => fallbackAnalysis(opts.projectName, Boolean(opts.projectPath)),
-          )
-        : fallbackAnalysis(opts.projectName, Boolean(opts.projectPath))
+      const executionResult = await runAgentToolLoop(
+        store,
+        workspaceStore,
+        taskId,
+        [{ role: "user", content: buildExecutionPrompt(userRequest, opts, contextBundle.contextSummary) }],
+        workspaceContext,
+        opts,
+        () => fallbackAnalysis(opts.projectName, Boolean(opts.projectPath)),
+      )
 
-      const parsedPatch = parsePatchFromText(executionText, opts)
-      const visibleExecution = stripPatchBlock(executionText)
+      const parsedPatch = executionResult.patchFiles
+      const visibleExecution = stripToolCallBlock(stripPatchBlock(executionResult.text))
 
       if (visibleExecution) {
         store.addMessage(taskId, "assistant", visibleExecution)
@@ -484,22 +624,25 @@ export function useAgentTaskService() {
         threadId: task.threadId,
       })
 
-      const patchText = isConfigured()
-        ? await streamLLM(
-            [{ role: "user", content: buildPatchPrompt(task, contextBundle.contextSummary) }],
-            workspaceContext,
-            () => "已完成补丁生成尝试，但当前上下文仍不足以输出安全补丁。你可以指定目标文件后继续。",
-          )
-        : "已完成补丁生成尝试，但当前未配置模型，暂时无法输出真实补丁。"
-
-      const parsedPatch = parsePatchFromText(patchText, {
+      const patchOpts = {
         projectPath: task.projectPath,
         projectName: task.projectName,
         activeFile: task.activeFile,
         modelName: task.modelName,
         threadId: task.threadId,
-      })
-      const visibleText = stripPatchBlock(patchText)
+      }
+      const patchResult = await runAgentToolLoop(
+        store,
+        workspaceStore,
+        taskId,
+        [{ role: "user", content: buildPatchPrompt(task, contextBundle.contextSummary) }],
+        workspaceContext,
+        patchOpts,
+        () => "已完成补丁生成尝试，但当前上下文仍不足以输出安全补丁。你可以指定目标文件后继续。",
+      )
+
+      const parsedPatch = patchResult.patchFiles
+      const visibleText = stripToolCallBlock(stripPatchBlock(patchResult.text))
 
       if (visibleText) {
         store.addMessage(taskId, "assistant", visibleText)

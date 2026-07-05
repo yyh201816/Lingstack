@@ -6,6 +6,7 @@ import {
   Circle,
   RefreshCw,
   Sparkles,
+  Wrench,
   User,
   Zap,
 } from "lucide-vue-next"
@@ -26,18 +27,41 @@ const activeTask = computed(() =>
 )
 
 const messages = computed(() => {
+  if (activeTask.value) {
+    return activeTask.value.messages.map((message) => ({
+      ...message,
+      threadId: activeThreadId.value || activeTask.value?.threadId || "",
+      type: message.role === "tool" ? "tool_log" : message.role,
+    }))
+  }
+
   const threadId = threadStore.activeThreadId
   return threadId ? sessionStore.getMessages(threadId) : []
 })
 
 const hasPlan = computed(() => (activeTask.value?.steps?.length ?? 0) > 0)
 
-function getRoleLabel(type: string, role?: string): string {
-  if (role === "user") return "你"
-  if (role === "assistant") return "灵栈"
-  if (role === "system") return "系统"
-  if (type === "task_status") return "任务"
-  return "消息"
+function getToolTitle(meta?: Record<string, unknown>): string {
+  if (!meta) return "工具调用"
+  const toolName = String(meta.toolName || "unknown")
+  const kind = meta.kind === "tool_result" ? "工具结果" : "工具调用"
+  return `${kind} · ${toolName}`
+}
+
+function getToolStatus(meta?: Record<string, unknown>): string {
+  const status = String(meta?.status || "")
+  if (status === "success") return "成功"
+  if (status === "failed") return "失败"
+  if (status === "running") return "执行中"
+  return "已记录"
+}
+
+function getToolStatusTone(meta?: Record<string, unknown>): string {
+  const status = String(meta?.status || "")
+  if (status === "success") return "success"
+  if (status === "failed") return "danger"
+  if (status === "running") return "running"
+  return "idle"
 }
 
 function getStepIcon(status: string) {
@@ -89,7 +113,6 @@ function getStepIcon(status: string) {
           </div>
 
           <template v-for="msg in messages" :key="msg.id">
-            <!-- 用户消息 -->
             <div v-if="msg.role === 'user'" class="center-pane__msg center-pane__msg--user">
               <div class="center-pane__msg-bubble center-pane__msg-bubble--user">
                 <div class="center-pane__msg-role">
@@ -100,7 +123,6 @@ function getStepIcon(status: string) {
               </div>
             </div>
 
-            <!-- Agent 回复 -->
             <div v-else-if="msg.role === 'assistant'" class="center-pane__msg center-pane__msg--assistant">
               <div class="center-pane__msg-bubble center-pane__msg-bubble--assistant">
                 <div class="center-pane__msg-role">
@@ -114,7 +136,20 @@ function getStepIcon(status: string) {
               </div>
             </div>
 
-            <!-- 系统事件卡 -->
+            <div v-else-if="msg.role === 'tool'" class="center-pane__msg center-pane__msg--event">
+              <div class="center-pane__tool-card" :class="`center-pane__tool-card--${getToolStatusTone(msg.meta)}`">
+                <div class="center-pane__tool-head">
+                  <Wrench :size="13" />
+                  <span>{{ getToolTitle(msg.meta) }}</span>
+                  <span class="center-pane__tool-status">{{ getToolStatus(msg.meta) }}</span>
+                </div>
+                <div v-if="msg.meta?.params" class="center-pane__tool-params">
+                  参数：{{ JSON.stringify(msg.meta.params) }}
+                </div>
+                <div class="center-pane__tool-body">{{ msg.content }}</div>
+              </div>
+            </div>
+
             <div v-else class="center-pane__msg center-pane__msg--event">
               <div class="center-pane__event-card">
                 <div class="center-pane__event-head">
@@ -126,9 +161,6 @@ function getStepIcon(status: string) {
             </div>
           </template>
 
-          <div v-if="messages.length === 0" class="center-pane__placeholder-text">
-            暂无消息，请在底部 Command Bar 输入你的任务。
-          </div>
         </div>
       </div>
     </template>
@@ -340,6 +372,63 @@ function getStepIcon(status: string) {
   border-radius: 10px;
   border: 1px solid var(--ls-border-soft);
   background: var(--ls-bg-muted, #f9fafb);
+}
+
+.center-pane__tool-card {
+  max-width: 680px;
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--ls-border-soft);
+  border-radius: 12px;
+  background: var(--ls-bg-surface);
+}
+
+.center-pane__tool-card--running {
+  border-color: var(--ls-brand-100, #dbeafe);
+  background: var(--ls-brand-50, #eff6ff);
+}
+
+.center-pane__tool-card--success {
+  border-color: var(--ls-success-soft, #dcfce7);
+}
+
+.center-pane__tool-card--danger {
+  border-color: var(--ls-danger-soft, #fee2e2);
+}
+
+.center-pane__tool-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  color: var(--ls-text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.center-pane__tool-status {
+  margin-left: auto;
+  color: var(--ls-text-subtle);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.center-pane__tool-params {
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--ls-bg-muted, #f9fafb);
+  color: var(--ls-text-subtle);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.center-pane__tool-body {
+  color: var(--ls-text-muted);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
 }
 
 .center-pane__event-head {

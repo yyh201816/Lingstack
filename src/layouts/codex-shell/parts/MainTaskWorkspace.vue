@@ -18,7 +18,6 @@ import { useAgentTaskService } from "@/features/agent-runtime/agent-task.service
 import { useAgentTaskStore } from "@/features/agent-runtime/agent-task.store"
 import { useProjectStore } from "@/features/projects/store/project.store"
 import { useThreadStore } from "@/features/threads/store/thread.store"
-import { useThreadSessionStore } from "@/features/threads/store/thread-session.store"
 import { useProjectService } from "@/features/workspace/composables/useProjectService"
 import { useWorkspaceStore } from "@/features/workspace/store/workspace.store"
 
@@ -30,14 +29,12 @@ const agentTaskService = useAgentTaskService()
 const agentTaskStore = useAgentTaskStore()
 const projectService = useProjectService()
 const projectStore = useProjectStore()
-const threadSessionStore = useThreadSessionStore()
 const threadStore = useThreadStore()
 const workspaceStore = useWorkspaceStore()
 
 const message = ref("")
 const isSending = ref(false)
 const inputMode = ref<"qa" | "agent">("qa")
-const syncedMessageKeys = new Set<string>()
 
 function getProjectDisplayName(projectPath?: string | null): string {
   if (!projectPath) return "未打开项目"
@@ -170,29 +167,6 @@ async function handleContinuePatch() {
   if (!activeTask.value) return
   await agentTaskService.continueGeneratePatch(activeTask.value.id)
 }
-
-watch(
-  () => activeTask.value?.messages.length,
-  () => {
-    const task = activeTask.value
-    const threadId = activeThreadId.value
-    if (!task || !threadId) return
-
-    for (const item of task.messages) {
-      const key = `${task.id}:${item.id}`
-      if (syncedMessageKeys.has(key)) continue
-      syncedMessageKeys.add(key)
-
-      threadSessionStore.appendMessage(
-        threadId,
-        item.role === "user" ? "user" : item.role === "assistant" ? "assistant" : "system",
-        item.content,
-        item.role === "tool" ? "system" : item.role,
-      )
-    }
-  },
-  { immediate: true },
-)
 
 watch(
   () => activeTask.value?.status,
